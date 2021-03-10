@@ -26,7 +26,7 @@ const (
 	rdsLabelClusterID       = rdsLabel + "cluster_id"
 	rdsLabelInstanceState   = rdsLabel + "instance_state"
 	rdsLabelInstanceType    = rdsLabel + "instance_type"
-	rdsLabelRdsInstanceType = rdsLabel + "rds_instance_type"
+	rdsLabelRole            = rdsLabel + "role"
 	rdsLabelEngine          = rdsLabel + "engine"
 	rdsLabelEngineVersion   = rdsLabel + "engine_version"
 	rdsLabelTag             = rdsLabel + "tag_"
@@ -123,16 +123,16 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 					labels[rdsLabelClusterID] = model.LabelValue(*dbi.DBClusterIdentifier)
 					if member, ok := memberMap[*dbi.DBInstanceIdentifier]; ok {
 						if *member.IsClusterWriter {
-							labels[rdsLabelRdsInstanceType] = model.LabelValue("writer")
+							labels[rdsLabelRole] = model.LabelValue("writer")
 						} else {
-							labels[rdsLabelRdsInstanceType] = model.LabelValue("reader")
+							labels[rdsLabelRole] = model.LabelValue("reader")
 						}
 					}
 				case "mysql":
 					if dbi.ReadReplicaSourceDBInstanceIdentifier == nil {
-						labels[rdsLabelRdsInstanceType] = model.LabelValue("master")
+						labels[rdsLabelRole] = model.LabelValue("master")
 					} else {
-						labels[rdsLabelRdsInstanceType] = model.LabelValue("slave")
+						labels[rdsLabelRole] = model.LabelValue("slave")
 					}
 				}
 
