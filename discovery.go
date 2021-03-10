@@ -23,8 +23,10 @@ const (
 	rdsLabelAZ              = rdsLabel + "availability_zone"
 	rdsLabelInstanceID      = rdsLabel + "instance_id"
 	rdsLabelResourceID      = rdsLabel + "resource_id"
+	rdsLabelClusterID       = rdsLabel + "cluster_id"
 	rdsLabelInstanceState   = rdsLabel + "instance_state"
 	rdsLabelInstanceType    = rdsLabel + "instance_type"
+	rdsLabelRdsInstanceType = rdsLabel + "rds_instance_type"
 	rdsLabelEngine          = rdsLabel + "engine"
 	rdsLabelEngineVersion   = rdsLabel + "engine_version"
 	rdsLabelTag             = rdsLabel + "tag_"
@@ -70,6 +72,20 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 		sess := session.Must(session.NewSession())
 		client := rds.New(sess, &aws.Config{Region: aws.String(region)})
 
+		memberMap := make(map[string]*rds.DBClusterMember)
+		if err := client.DescribeDBClustersPagesWithContext(ctx, &rds.DescribeDBClustersInput{}, func(out *rds.DescribeDBClustersOutput, lastPage bool) bool {
+			for _, cluster := range out.DBClusters {
+				for _, member := range cluster.DBClusterMembers {
+					memberMap[*member.DBInstanceIdentifier] = member
+				}
+			}
+			return !lastPage
+		}); err != nil {
+			level.Error(d.logger).Log("msg", "could not describe db cluster", "err", err)
+			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+			continue
+		}
+
 		input := &rds.DescribeDBInstancesInput{
 			Filters: d.filters,
 		}
@@ -99,6 +115,26 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 
 				labels[rdsLabelEndpointAddress] = model.LabelValue(*dbi.Endpoint.Address)
 				labels[rdsLabelEndpointPort] = model.LabelValue(strconv.FormatInt(*dbi.Endpoint.Port, 10))
+
+				switch *dbi.Engine {
+				case "aurora":
+					fallthrough
+				case "aurora-mysql":
+					labels[rdsLabelClusterID] = model.LabelValue(*dbi.DBClusterIdentifier)
+					if member, ok := memberMap[*dbi.DBInstanceIdentifier]; ok {
+						if *member.IsClusterWriter {
+							labels[rdsLabelRdsInstanceType] = model.LabelValue("writer")
+						} else {
+							labels[rdsLabelRdsInstanceType] = model.LabelValue("reader")
+						}
+					}
+				case "mysql":
+					if dbi.ReadReplicaSourceDBInstanceIdentifier == nil {
+						labels[rdsLabelRdsInstanceType] = model.LabelValue("master")
+					} else {
+						labels[rdsLabelRdsInstanceType] = model.LabelValue("slave")
+					}
+				}
 
 				tags, err := listTagsForInstance(client, dbi)
 				if err != nil {
