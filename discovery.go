@@ -7,12 +7,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
+	"github.com/aws/aws-sdk-go-v2/service/rds/types"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
@@ -38,7 +38,7 @@ const (
 type discovery struct {
 	refreshInterval int
 	logger          log.Logger
-	filters         []*rds.Filter
+	filters         []types.Filter
 }
 
 func newDiscovery(conf sdConfig, logger log.Logger) (*discovery, error) {
@@ -59,7 +59,7 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	var region string
 	for region == "" {
 		var err error
-		region, err = getDefaultRegion()
+		region, err = d.getDefaultRegion(ctx)
 		if err != nil {
 			level.Error(d.logger).Log("msg", "could not get default region", "err", err)
 			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
@@ -69,30 +69,44 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	for c := time.Tick(time.Duration(d.refreshInterval) * time.Second); ; {
 		var tgs []*targetgroup.Group
 
-		sess := session.Must(session.NewSession())
-		client := rds.New(sess, &aws.Config{Region: aws.String(region)})
+		sdkConfig, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+		if err != nil {
+			level.Error(d.logger).Log("msg", "could not load config", "err", err)
+			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+			continue
+		}
+		client := rds.NewFromConfig(sdkConfig)
 
-		memberMap := make(map[string]*rds.DBClusterMember)
-		if err := client.DescribeDBClustersPagesWithContext(ctx, &rds.DescribeDBClustersInput{}, func(out *rds.DescribeDBClustersOutput, lastPage bool) bool {
+		memberMap := make(map[string]types.DBClusterMember)
+		paginator := rds.NewDescribeDBClustersPaginator(client, &rds.DescribeDBClustersInput{})
+		for paginator.HasMorePages() {
+			out, err := paginator.NextPage(ctx)
+			if err != nil {
+				level.Error(d.logger).Log("msg", "could not describe db cluster", "err", err)
+				time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+				continue
+			}
 			for _, cluster := range out.DBClusters {
 				for _, member := range cluster.DBClusterMembers {
 					memberMap[*member.DBInstanceIdentifier] = member
 				}
 			}
-			return !lastPage
-		}); err != nil {
-			level.Error(d.logger).Log("msg", "could not describe db cluster", "err", err)
-			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
-			continue
 		}
 
 		input := &rds.DescribeDBInstancesInput{
 			Filters: d.filters,
 		}
 
-		if err := client.DescribeDBInstancesPagesWithContext(ctx, input, func(out *rds.DescribeDBInstancesOutput, lastPage bool) bool {
+		paginator2 := rds.NewDescribeDBInstancesPaginator(client, input)
+		for paginator2.HasMorePages() {
+			out, err := paginator2.NextPage(ctx)
+			if err != nil {
+				level.Error(d.logger).Log("msg", "could not describe db instance", "err", err)
+				time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+				continue
+			}
 			for _, dbi := range out.DBInstances {
-				if dbi.Endpoint == nil || dbi.Endpoint.Address == nil || dbi.Endpoint.Port == nil {
+				if dbi.Endpoint.Address == nil {
 					continue // instance is not ready
 				}
 
@@ -105,7 +119,7 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 				labels[rdsLabelInstanceState] = model.LabelValue(*dbi.DBInstanceStatus)
 				labels[rdsLabelInstanceType] = model.LabelValue(*dbi.DBInstanceClass)
 
-				addr := net.JoinHostPort(*dbi.Endpoint.Address, strconv.FormatInt(*dbi.Endpoint.Port, 10))
+				addr := net.JoinHostPort(*dbi.Endpoint.Address, strconv.FormatInt(int64(dbi.Endpoint.Port), 10))
 				labels[model.AddressLabel] = model.LabelValue(addr)
 
 				labels[rdsLabelEngine] = model.LabelValue(*dbi.Engine)
@@ -114,7 +128,7 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 				labels[rdsLabelVPCID] = model.LabelValue(*dbi.DBSubnetGroup.VpcId)
 
 				labels[rdsLabelEndpointAddress] = model.LabelValue(*dbi.Endpoint.Address)
-				labels[rdsLabelEndpointPort] = model.LabelValue(strconv.FormatInt(*dbi.Endpoint.Port, 10))
+				labels[rdsLabelEndpointPort] = model.LabelValue(strconv.FormatInt(int64(dbi.Endpoint.Port), 10))
 
 				switch *dbi.Engine {
 				case "aurora":
@@ -122,7 +136,7 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 				case "aurora-mysql":
 					labels[rdsLabelClusterID] = model.LabelValue(*dbi.DBClusterIdentifier)
 					if member, ok := memberMap[*dbi.DBInstanceIdentifier]; ok {
-						if *member.IsClusterWriter {
+						if member.IsClusterWriter {
 							labels[rdsLabelRole] = model.LabelValue("writer")
 						} else {
 							labels[rdsLabelRole] = model.LabelValue("reader")
@@ -136,14 +150,14 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 					}
 				}
 
-				tags, err := listTagsForInstance(client, dbi)
+				tags, err := listTagsForInstance(ctx, client, dbi)
 				if err != nil {
 					level.Error(d.logger).Log("msg", "could not list tags for db instance", "err", err)
 					continue
 				}
 
 				for _, t := range tags.TagList {
-					if t == nil || t.Key == nil || t.Value == nil {
+					if t.Key == nil || t.Value == nil {
 						continue
 					}
 
@@ -157,11 +171,6 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 					Labels:  labels,
 				})
 			}
-			return !lastPage
-		}); err != nil {
-			level.Error(d.logger).Log("msg", "could not describe db instance", "err", err)
-			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
-			continue
 		}
 
 		ch <- tgs
@@ -175,31 +184,31 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	}
 }
 
-func listTagsForInstance(client *rds.RDS, dbi *rds.DBInstance) (*rds.ListTagsForResourceOutput, error) {
+func listTagsForInstance(ctx context.Context, client *rds.Client, dbi types.DBInstance) (*rds.ListTagsForResourceOutput, error) {
 	input := &rds.ListTagsForResourceInput{
-		ResourceName: aws.String(*dbi.DBInstanceArn),
+		ResourceName: dbi.DBInstanceArn,
 	}
-	return client.ListTagsForResource(input)
+	return client.ListTagsForResource(ctx, input)
 }
 
-func getDefaultRegion() (string, error) {
+func (d *discovery) getDefaultRegion(ctx context.Context) (string, error) {
 	var region string
 
-	sess := session.Must(session.NewSession())
-	metadata := ec2metadata.New(sess, &aws.Config{
-		MaxRetries: aws.Int(0),
-	})
-	if metadata.Available() {
-		var err error
-		region, err = metadata.Region()
-		if err != nil {
-			return "", err
-		}
-	} else {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryMaxAttempts(0))
+	if err != nil {
+		level.Error(d.logger).Log("err", err)
+		return "", err
+	}
+
+	client := imds.NewFromConfig(cfg)
+	response, err := client.GetRegion(ctx, &imds.GetRegionInput{})
+	if err != nil {
 		region = os.Getenv("AWS_REGION")
 		if region == "" {
 			region = "us-east-1"
 		}
+	} else {
+		region = response.Region
 	}
 
 	return region, nil
