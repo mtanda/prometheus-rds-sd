@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/rds"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-type rdsFiltersValue []*rds.Filter
+type rdsFiltersValue []types.Filter
 
 func (r *rdsFiltersValue) Set(value string) error {
 	parts := strings.SplitN(value, ",", 2)
@@ -28,16 +28,16 @@ func (r *rdsFiltersValue) Set(value string) error {
 	}
 	values := strings.Split(vargs[1], ",")
 
-	filter := rds.Filter{
+	filter := types.Filter{
 		Name:   aws.String(nargs[1]),
-		Values: make([]*string, len(values)),
+		Values: make([]string, len(values)),
 	}
 
 	for i, v := range values {
-		filter.Values[i] = aws.String(v)
+		filter.Values[i] = v
 	}
 
-	*r = append(*r, &filter)
+	*r = append(*r, filter)
 
 	return nil
 }
@@ -50,8 +50,8 @@ func (r *rdsFiltersValue) IsCumulative() bool {
 	return true
 }
 
-func rdsFilters(s kingpin.Settings) (target *[]*rds.Filter) {
-	target = &[]*rds.Filter{}
+func rdsFilters(s kingpin.Settings) (target *[]types.Filter) {
+	target = &[]types.Filter{}
 	s.SetValue((*rdsFiltersValue)(target))
 	return
 }

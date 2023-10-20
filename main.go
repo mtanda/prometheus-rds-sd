@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/go-kit/kit/log"
+	"github.com/aws/aws-sdk-go-v2/service/rds/types"
+	"github.com/go-kit/log"
 	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/prometheus/prometheus/documentation/examples/custom-sd/adapter"
@@ -28,7 +28,7 @@ var (
 
 type sdConfig struct {
 	RefreshInterval int
-	Filters         []*rds.Filter
+	Filters         []types.Filter
 }
 
 func main() {
