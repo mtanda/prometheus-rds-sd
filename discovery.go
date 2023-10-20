@@ -2,15 +2,20 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/rds/types"
+	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
+	rgtTypes "github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/common/model"
@@ -56,6 +61,17 @@ func newDiscovery(conf sdConfig, logger log.Logger) (*discovery, error) {
 }
 
 func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	var accountId string
+	for accountId == "" {
+		var err error
+		accountId, err = d.getAccountId(ctx)
+		if err != nil {
+			level.Error(d.logger).Log("msg", "could not get account id", "err", err)
+			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+			continue
+		}
+	}
+
 	var region string
 	for region == "" {
 		var err error
@@ -76,6 +92,13 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 			continue
 		}
 		client := rds.NewFromConfig(sdkConfig)
+
+		tagsIndexByArn, err := getTags(ctx, sdkConfig)
+		if err != nil {
+			level.Error(d.logger).Log("msg", "could not get tags", "err", err)
+			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+			continue
+		}
 
 		memberMap := make(map[string]types.DBClusterMember)
 		paginator := rds.NewDescribeDBClustersPaginator(client, &rds.DescribeDBClustersInput{})
@@ -150,13 +173,8 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 					}
 				}
 
-				tags, err := listTagsForInstance(ctx, client, dbi)
-				if err != nil {
-					level.Error(d.logger).Log("msg", "could not list tags for db instance", "err", err)
-					continue
-				}
-
-				for _, t := range tags.TagList {
+				arn := fmt.Sprintf("arn:aws:rds:%s:%s:db:%s", region, accountId, *dbi.DBInstanceIdentifier)
+				for _, t := range tagsIndexByArn[arn] {
 					if t.Key == nil || t.Value == nil {
 						continue
 					}
@@ -184,11 +202,45 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	}
 }
 
-func listTagsForInstance(ctx context.Context, client *rds.Client, dbi types.DBInstance) (*rds.ListTagsForResourceOutput, error) {
-	input := &rds.ListTagsForResourceInput{
-		ResourceName: dbi.DBInstanceArn,
+func getTags(ctx context.Context, sdkConfig aws.Config) (map[string][]rgtTypes.Tag, error) {
+	tags := make(map[string][]rgtTypes.Tag)
+
+	client := resourcegroupstaggingapi.NewFromConfig(sdkConfig)
+	input := &resourcegroupstaggingapi.GetResourcesInput{
+		ResourceTypeFilters: []string{"rds:db"},
+		TagsPerPage:         aws.Int32(500),
 	}
-	return client.ListTagsForResource(ctx, input)
+	paginator := resourcegroupstaggingapi.NewGetResourcesPaginator(client, input)
+	for paginator.HasMorePages() {
+		out, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, mapping := range out.ResourceTagMappingList {
+			if _, ok := tags[*mapping.ResourceARN]; !ok {
+				tags[*mapping.ResourceARN] = mapping.Tags
+			} else {
+				tags[*mapping.ResourceARN] = append(tags[*mapping.ResourceARN], mapping.Tags...)
+			}
+		}
+	}
+
+	return tags, nil
+}
+
+func (d *discovery) getAccountId(ctx context.Context) (string, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryMaxAttempts(0))
+	if err != nil {
+		return "", err
+	}
+
+	client := sts.NewFromConfig(cfg)
+	response, err := client.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", err
+	}
+
+	return *response.Account, nil
 }
 
 func (d *discovery) getDefaultRegion(ctx context.Context) (string, error) {
