@@ -61,17 +61,6 @@ func newDiscovery(conf sdConfig, logger log.Logger) (*discovery, error) {
 }
 
 func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
-	var accountId string
-	for accountId == "" {
-		var err error
-		accountId, err = d.getAccountId(ctx)
-		if err != nil {
-			level.Error(d.logger).Log("msg", "could not get account id", "err", err)
-			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
-			continue
-		}
-	}
-
 	var region string
 	for region == "" {
 		var err error
@@ -82,6 +71,18 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 			continue
 		}
 	}
+
+	var accountId string
+	for accountId == "" {
+		var err error
+		accountId, err = d.getAccountId(ctx, region)
+		if err != nil {
+			level.Error(d.logger).Log("msg", "could not get account id", "err", err)
+			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+			continue
+		}
+	}
+
 	for c := time.Tick(time.Duration(d.refreshInterval) * time.Second); ; {
 		var tgs []*targetgroup.Group
 
@@ -129,7 +130,7 @@ func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 				continue
 			}
 			for _, dbi := range out.DBInstances {
-				if dbi.Endpoint.Address == nil {
+				if dbi.Endpoint == nil || dbi.Endpoint.Address == nil {
 					continue // instance is not ready
 				}
 
@@ -228,8 +229,8 @@ func getTags(ctx context.Context, sdkConfig aws.Config) (map[string][]rgtTypes.T
 	return tags, nil
 }
 
-func (d *discovery) getAccountId(ctx context.Context) (string, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryMaxAttempts(0))
+func (d *discovery) getAccountId(ctx context.Context, region string) (string, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region), config.WithRetryMaxAttempts(0))
 	if err != nil {
 		return "", err
 	}
